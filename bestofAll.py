@@ -572,7 +572,11 @@ EXIT;
                     # Move to next batch
                     batch_number += 1
                 
-                # Write all JSON records to output file
-                output_mode = "wt"
-                output_fp = gzip.open(final_output, output_mode, encoding="utf-8", newline="") if self.compress \
-                         else final_output.open(output_mode, encoding="utf-8", new
+                                    # Write all JSON records to output file
+                    output_mode = "wt"
+                    output_fp = gzip.open(final_output, output_mode, encoding="utf-8", newline="") if self.compress \
+                             else final_output.open(output_mode, encoding="utf-8", newline="")
+                    
+                    with output_fp as f_out:
+                        json.dump(json_rows, f_out, indent=2)
+                        logger.info(f"Written {total_rows} JSON records to {final_output}")

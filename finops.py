@@ -1,213 +1,315 @@
 from flask import Flask, jsonify, request
+from flask_cors import CORS
+import pandas as pd
 import json
 import os
 from datetime import datetime
-import snowflake.connector
-import pandas as pd
-from uuid import uuid4
+import logging
 
 app = Flask(__name__)
+CORS(app)
 
-# Configuration
-CACHE_DIR = "cache"
-TABLES = [
-    "QUERY_HISTORY_SUMMARY",
-    "QUERY_DETAILS_COMPLETE",
-    "WAREHOUSE_ANALYTICS_DASHBOARD_with_queries",
-    "user_query_performance_report"
-]
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Ensure cache directory exists
-if not os.path.exists(CACHE_DIR):
-    os.makedirs(CACHE_DIR)
+# Global variables to store cached data
+cached_data = {}
+snowflake_cursor = None
 
-def execute_and_cache_query(cursor, table_name):
-    """Execute SELECT * query and cache results as JSON"""
+def set_snowflake_cursor(cursor):
+    """Set the Snowflake cursor (to be called from main script)"""
+    global snowflake_cursor
+    snowflake_cursor = cursor
+
+def execute_query_and_cache(table_name, query):
+    """Execute query and cache results as JSON for faster retrieval"""
+    global cached_data, snowflake_cursor
+    
     try:
-        query = f"SELECT * FROM {table_name}"
-        cursor.execute(query)
-        results = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
+        logger.info(f"Executing query for {table_name}")
+        snowflake_cursor.execute(query)
+        results = snowflake_cursor.fetchall()
+        columns = [desc[0] for desc in snowflake_cursor.description]
         
-        # Convert to DataFrame and then to JSON
+        # Convert to DataFrame
         df = pd.DataFrame(results, columns=columns)
-        cache_file = os.path.join(CACHE_DIR, f"{table_name}.json")
         
-        # Save to JSON
-        with open(cache_file, 'w') as f:
-            json.dump(df.to_dict(orient='records'), f, default=str)
-            
-        return {"status": "success", "table": table_name, "rows": len(results)}
+        # Handle datetime and other non-JSON serializable types
+        for col in df.columns:
+            if df[col].dtype == 'object':
+                df[col] = df[col].astype(str)
+        
+        # Cache as JSON for faster API responses
+        cached_data[table_name] = df.to_dict('records')
+        logger.info(f"Cached {len(cached_data[table_name])} records for {table_name}")
+        
+        return True
     except Exception as e:
-        return {"status": "error", "table": table_name, "error": str(e)}
+        logger.error(f"Error executing query for {table_name}: {str(e)}")
+        return False
 
-def get_users_with_query_count_by_warehouse(warehouse_id, query_type, query_ids):
-    """Fetch user query counts for a warehouse and query type"""
-    try:
-        # Load QUERY_HISTORY_SUMMARY from cache
-        cache_file = os.path.join(CACHE_DIR, "QUERY_HISTORY_SUMMARY.json")
-        if not os.path.exists(cache_file):
-            return pd.DataFrame(columns=["user_name", "query_count", "query_ids"])
-        
-        with open(cache_file, 'r') as f:
-            data = json.load(f)
-        df = pd.DataFrame(data)
-        
-        # Map query_type to the corresponding QUERY_IDS field
-        query_type_mapping = {
-            "QUERIES_1_10_SEC": "1-10_sec_ids",
-            "QUERIES_10_20_SEC": "10-20_sec_ids",
-            "QUERIES_20_60_SEC": "20-60_sec_ids",
-            "QUERIES_1_3_MIN": "1-3_min_ids",
-            "QUERIES_3_5_MIN": "3-5_min_ids",
-            "QUERIES_5_PLUS_MIN": "5_plus_min_ids",
-            "QUEUED_1_2_MIN": "queued_1-2_min_ids",
-            "QUEUED_2_5_MIN": "queued_2-5_min_ids",
-            "QUEUED_5_10_MIN": "queued_5-10_min_ids",
-            "QUEUED_10_20_MIN": "queued_10-20_min_ids",
-            "QUEUED_20_PLUS_MIN": "queued_20_plus_min_ids",
-            "QUERIES_SPILLED_LOCAL": "spilled_local_ids",
-            "QUERIES_SPILLED_REMOTE": "spilled_remote_ids",
-            "FAILED_QUERIES": "failed_queries_ids",
-            "SUCCESSFUL_QUERIES": "successful_queries_ids",
-            "RUNNING_QUERIES": "running_queries_ids",
-            "QUERIES_0_20_CENTS": "credit_0-20_cents_ids",
-            "QUERIES_20_40_CENTS": "credit_20-40_cents_ids",
-            "QUERIES_40_60_CENTS": "credit_40-60_cents_ids",
-            "QUERIES_60_80_CENTS": "credit_60-80_cents_ids",
-            "QUERIES_80_100_CENTS": "credit_80-100_cents_ids",
-            "QUERIES_100_PLUS_CENTS": "credit_100_plus_cents_ids"
-        }
-        
-        # Filter by warehouse_id and extract query_ids
-        filtered_df = df[df["WAREHOUSE_ID"] == warehouse_id]
-        if filtered_df.empty or query_type not in query_type_mapping:
-            return pd.DataFrame(columns=["user_name", "query_count", "query_ids"])
-        
-        # Extract query IDs for the specified query_type
-        query_ids_field = query_type_mapping[query_type]
-        query_ids_list = filtered_df[query_ids_field].iloc[0] if query_ids_field in filtered_df else []
-        query_ids_list = [qid for qid in query_ids_list if qid]  # Remove nulls
-        
-        # Filter QUERY_HISTORY_SUMMARY by query_ids
-        summary_df = pd.DataFrame(data)
-        result_df = summary_df[summary_df["QUERY_ID"].isin(query_ids_list)][["USER_NAME", "QUERY_ID"]]
-        
-        # Group by user_name
-        result = result_df.groupby("USER_NAME").agg(
-            query_count=pd.NamedAgg(column="QUERY_ID", aggfunc="count"),
-            query_ids=pd.NamedAgg(column="QUERY_ID", aggfunc=list)
-        ).reset_index()
-        
-        return result
-    except Exception as e:
-        print(f"Error in get_users_with_query_count_by_warehouse: {str(e)}")
-        return pd.DataFrame(columns=["user_name", "query_count", "query_ids"])
-
-def get_query_preview_by_ids(query_ids):
-    """Fetch query previews for a list of query IDs"""
-    try:
-        cache_file = os.path.join(CACHE_DIR, "QUERY_DETAILS_COMPLETE.json")
-        if not os.path.exists(cache_file):
-            return pd.DataFrame(columns=["QUERY_ID", "QUERY_TEXT_PREVIEW"])
-        
-        with open(cache_file, 'r') as f:
-            data = json.load(f)
-        df = pd.DataFrame(data)
-        
-        # Filter by query_ids and select relevant columns
-        result = df[df["QUERY_ID"].isin(query_ids)][["QUERY_ID", "QUERY_TEXT"]]
-        result = result.rename(columns={"QUERY_TEXT": "QUERY_TEXT_PREVIEW"})
-        return result
-    except Exception as e:
-        print(f"Error in get_query_preview_by_ids: {str(e)}")
-        return pd.DataFrame(columns=["QUERY_ID", "QUERY_TEXT_PREVIEW"])
-
-def get_query_details_by_id(query_id):
-    """Fetch full details for a single query ID"""
-    try:
-        cache_file = os.path.join(CACHE_DIR, "QUERY_DETAILS_COMPLETE.json")
-        if not os.path.exists(cache_file):
-            return pd.DataFrame(columns=[])
-        
-        with open(cache_file, 'r') as f:
-            data = json.load(f)
-        df = pd.DataFrame(data)
-        
-        # Filter by query_id
-        result = df[df["QUERY_ID"] == query_id]
-        return result
-    except Exception as e:
-        print(f"Error in get_query_details_by_id: {str(e)}")
-        return pd.DataFrame(columns=[])
-
-@app.route('/refresh-cache', methods=['POST'])
-def refresh_cache():
-    """Execute queries for all tables and refresh cache"""
-    results = []
-    for table in TABLES:
-        result = execute_and_cache_query(cursor, table)  # cursor needs to be defined
-        results.append(result)
-    return jsonify({
-        "timestamp": datetime.utcnow().isoformat(),
-        "results": results
-    })
-
-@app.route('/get-data/<table_name>', methods=['GET'])
-def get_data(table_name):
-    """Serve cached data for a specific table"""
-    if table_name not in TABLES:
-        return jsonify({"error": "Invalid table name"}), 400
+def refresh_all_tables():
+    """Refresh all table data from Snowflake"""
+    queries = {
+        'query_history_summary': """
+            SELECT * FROM QUERY_HISTORY_SUMMARY
+        """,
+        'query_details_complete': """
+            SELECT * FROM QUERY_DETAILS_COMPLETE
+        """,
+        'warehouse_analytics': """
+            SELECT * FROM WAREHOUSE_ANALYTICS_DASHBOARD_with_queries
+        """,
+        'user_performance_report': """
+            SELECT * FROM user_query_performance_report
+        """,
+        # Add the 5th table query here if needed
+        'account_summary': """
+            SELECT 
+                COUNT(*) as total_queries,
+                COUNT(DISTINCT user_name) as unique_users,
+                COUNT(DISTINCT warehouse_name) as unique_warehouses,
+                SUM(credits_used_cloud_services) as total_credits,
+                AVG(total_elapsed_time) as avg_execution_time,
+                CURRENT_TIMESTAMP as last_updated
+            FROM QUERY_HISTORY_SUMMARY
+        """
+    }
     
-    cache_file = os.path.join(CACHE_DIR, f"{table_name}.json")
-    if not os.path.exists(cache_file):
-        return jsonify({"error": "Data not cached. Please refresh cache first."}), 404
+    success_count = 0
+    for table_name, query in queries.items():
+        if execute_query_and_cache(table_name, query):
+            success_count += 1
     
-    try:
-        with open(cache_file, 'r') as f:
-            data = json.load(f)
-        return jsonify({
-            "table": table_name,
-            "data": data,
-            "row_count": len(data),
-            "timestamp": datetime.utcnow().isoformat()
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return success_count == len(queries)
 
-@app.route('/users-by-warehouse', methods=['POST'])
-def users_by_warehouse():
-    """Get user query counts for a warehouse and query type"""
+# API Endpoints
+
+@app.route('/api/refresh', methods=['POST'])
+def refresh_data():
+    """Refresh all cached data from Snowflake"""
+    if refresh_all_tables():
+        return jsonify({"status": "success", "message": "All tables refreshed successfully"})
+    else:
+        return jsonify({"status": "error", "message": "Error refreshing some tables"}), 500
+
+@app.route('/api/query-history-summary', methods=['GET'])
+def get_query_history_summary():
+    """Get query history summary data"""
+    if 'query_history_summary' not in cached_data:
+        return jsonify({"error": "Data not available. Please refresh first."}), 404
+    return jsonify(cached_data['query_history_summary'])
+
+@app.route('/api/query-details-complete', methods=['GET'])
+def get_query_details_complete():
+    """Get complete query details data"""
+    if 'query_details_complete' not in cached_data:
+        return jsonify({"error": "Data not available. Please refresh first."}), 404
+    return jsonify(cached_data['query_details_complete'])
+
+@app.route('/api/warehouse-analytics', methods=['GET'])
+def get_warehouse_analytics():
+    """Get warehouse analytics data"""
+    if 'warehouse_analytics' not in cached_data:
+        return jsonify({"error": "Data not available. Please refresh first."}), 404
+    
+    # Remove QUERY_IDS column for display
+    data = cached_data['warehouse_analytics'].copy()
+    for row in data:
+        if 'QUERY_IDS' in row:
+            del row['QUERY_IDS']
+    
+    return jsonify(data)
+
+@app.route('/api/user-performance-report', methods=['GET'])
+def get_user_performance_report():
+    """Get user performance report data"""
+    if 'user_performance_report' not in cached_data:
+        return jsonify({"error": "Data not available. Please refresh first."}), 404
+    
+    # Remove sample_queries column for display
+    data = cached_data['user_performance_report'].copy()
+    for row in data:
+        if 'sample_queries' in row:
+            del row['sample_queries']
+    
+    return jsonify(data)
+
+@app.route('/api/account-summary', methods=['GET'])
+def get_account_summary():
+    """Get account summary data"""
+    if 'account_summary' not in cached_data:
+        return jsonify({"error": "Data not available. Please refresh first."}), 404
+    return jsonify(cached_data['account_summary'])
+
+@app.route('/api/warehouse-drill-down', methods=['POST'])
+def get_warehouse_drill_down():
+    """Get drill-down data for warehouse queries"""
     data = request.json
     warehouse_id = data.get('warehouse_id')
+    warehouse_name = data.get('warehouse_name')
     query_type = data.get('query_type')
-    query_ids = data.get('query_ids', [])
     
-    if not warehouse_id or not query_type:
-        return jsonify({"error": "warehouse_id and query_type are required"}), 400
+    if not warehouse_id and not warehouse_name:
+        return jsonify({"error": "warehouse_id or warehouse_name required"}), 400
     
-    result_df = get_users_with_query_count_by_warehouse(warehouse_id, query_type, query_ids)
-    return jsonify(result_df.to_dict(orient='records'))
+    try:
+        # Find the warehouse data
+        warehouse_data = None
+        for row in cached_data.get('warehouse_analytics', []):
+            if (warehouse_id and str(row.get('WAREHOUSE_ID')) == str(warehouse_id)) or \
+               (warehouse_name and row.get('WAREHOUSE_NAME') == warehouse_name):
+                warehouse_data = row
+                break
+        
+        if not warehouse_data:
+            return jsonify({"error": "Warehouse not found"}), 404
+        
+        # Get original data with QUERY_IDS
+        original_data = None
+        for row in cached_data.get('warehouse_analytics', []):
+            if (warehouse_id and str(row.get('WAREHOUSE_ID')) == str(warehouse_id)) or \
+               (warehouse_name and row.get('WAREHOUSE_NAME') == warehouse_name):
+                original_data = row
+                break
+        
+        if not original_data or 'QUERY_IDS' not in original_data:
+            return jsonify({"error": "Query IDs not found"}), 404
+        
+        query_ids_json = original_data['QUERY_IDS']
+        if isinstance(query_ids_json, str):
+            query_ids_data = json.loads(query_ids_json)
+        else:
+            query_ids_data = query_ids_json
+        
+        # Get query IDs for the specific type
+        query_ids = query_ids_data.get(f"{query_type}_ids", [])
+        query_ids = [qid for qid in query_ids if qid is not None]
+        
+        if not query_ids:
+            return jsonify({"users": [], "query_count": 0})
+        
+        # Filter query details by these IDs and group by user
+        user_queries = {}
+        for query in cached_data.get('query_details_complete', []):
+            if query.get('QUERY_ID') in query_ids:
+                user_name = query.get('USER_NAME', 'Unknown')
+                if user_name not in user_queries:
+                    user_queries[user_name] = {
+                        'user_name': user_name,
+                        'query_count': 0,
+                        'query_ids': []
+                    }
+                user_queries[user_name]['query_count'] += 1
+                user_queries[user_name]['query_ids'].append(query.get('QUERY_ID'))
+        
+        return jsonify({
+            "users": list(user_queries.values()),
+            "total_queries": len(query_ids),
+            "warehouse_name": warehouse_name or warehouse_data.get('WAREHOUSE_NAME'),
+            "query_type": query_type
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in warehouse drill-down: {str(e)}")
+        return jsonify({"error": f"Internal error: {str(e)}"}), 500
 
-@app.route('/query-previews', methods=['POST'])
-def query_previews():
-    """Get query previews for a list of query IDs"""
+@app.route('/api/user-drill-down', methods=['POST'])
+def get_user_drill_down():
+    """Get drill-down data for user queries"""
+    data = request.json
+    user_name = data.get('user_name')
+    flag_type = data.get('flag_type')
+    
+    if not user_name or not flag_type:
+        return jsonify({"error": "user_name and flag_type required"}), 400
+    
+    try:
+        # Find user data with sample queries
+        user_queries = []
+        for row in cached_data.get('user_performance_report', []):
+            if row.get('user_name') == user_name and row.get('flag_type') == flag_type:
+                sample_queries_json = row.get('sample_queries', [])
+                if isinstance(sample_queries_json, str):
+                    sample_queries = json.loads(sample_queries_json)
+                else:
+                    sample_queries = sample_queries_json
+                
+                for query in sample_queries:
+                    if query and isinstance(query, dict):
+                        user_queries.append({
+                            'query_id': query.get('query_id'),
+                            'query_text_preview': query.get('query_text', '')[:100] + '...' if len(query.get('query_text', '')) > 100 else query.get('query_text', ''),
+                            'execution_time_ms': query.get('execution_time_ms'),
+                            'bytes_scanned': query.get('bytes_scanned'),
+                            'start_time': query.get('start_time'),
+                            'warehouse_size': query.get('warehouse_size')
+                        })
+                break
+        
+        return jsonify({
+            "queries": user_queries,
+            "user_name": user_name,
+            "flag_type": flag_type,
+            "query_count": len(user_queries)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in user drill-down: {str(e)}")
+        return jsonify({"error": f"Internal error: {str(e)}"}), 500
+
+@app.route('/api/query-details/<query_id>', methods=['GET'])
+def get_query_details(query_id):
+    """Get complete details for a specific query"""
+    try:
+        for query in cached_data.get('query_details_complete', []):
+            if str(query.get('QUERY_ID')) == str(query_id):
+                return jsonify(query)
+        
+        return jsonify({"error": "Query not found"}), 404
+        
+    except Exception as e:
+        logger.error(f"Error getting query details: {str(e)}")
+        return jsonify({"error": f"Internal error: {str(e)}"}), 500
+
+@app.route('/api/queries-by-ids', methods=['POST'])
+def get_queries_by_ids():
+    """Get query details for multiple query IDs"""
     data = request.json
     query_ids = data.get('query_ids', [])
     
     if not query_ids:
-        return jsonify({"error": "query_ids are required"}), 400
+        return jsonify({"error": "query_ids required"}), 400
     
-    result_df = get_query_preview_by_ids(query_ids)
-    return jsonify(result_df.to_dict(orient='records'))
+    try:
+        matching_queries = []
+        for query in cached_data.get('query_details_complete', []):
+            if query.get('QUERY_ID') in query_ids:
+                matching_queries.append({
+                    'query_id': query.get('QUERY_ID'),
+                    'query_text_preview': query.get('QUERY_TEXT', '')[:100] + '...' if len(query.get('QUERY_TEXT', '')) > 100 else query.get('QUERY_TEXT', ''),
+                    'execution_time_ms': query.get('TOTAL_ELAPSED_TIME'),
+                    'user_name': query.get('USER_NAME'),
+                    'warehouse_name': query.get('WAREHOUSE_NAME'),
+                    'start_time': query.get('START_TIME'),
+                    'execution_status': query.get('EXECUTION_STATUS')
+                })
+        
+        return jsonify({"queries": matching_queries})
+        
+    except Exception as e:
+        logger.error(f"Error getting queries by IDs: {str(e)}")
+        return jsonify({"error": f"Internal error: {str(e)}"}), 500
 
-@app.route('/query-details/<query_id>', methods=['GET'])
-def query_details(query_id):
-    """Get full details for a single query ID"""
-    result_df = get_query_details_by_id(query_id)
-    if result_df.empty:
-        return jsonify({"error": "Query ID not found"}), 404
-    return jsonify(result_df.to_dict(orient='records'))
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "cached_tables": list(cached_data.keys()),
+        "timestamp": datetime.now().isoformat()
+    })
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, port=5000)
